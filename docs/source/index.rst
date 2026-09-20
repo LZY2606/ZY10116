@@ -22,6 +22,7 @@ the configuration machinery.
     using_traitlets
     trait_types
     defining_traits
+    dynamic_default_dependencies
     api
     best-practices
     config

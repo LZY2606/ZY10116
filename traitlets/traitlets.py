@@ -41,6 +41,7 @@ Inheritance diagram:
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import enum
 import numbers
@@ -122,6 +123,7 @@ __all__ = [
     "UseEnum",
     "ValidateHandler",
     "default",
+    "depends_on",
     "directional_link",
     "dlink",
     "link",
@@ -678,34 +680,16 @@ class TraitType(BaseDescriptor, t.Generic[G, S]):
         try:
             value = obj._trait_values[self.name]
         except KeyError:
-            # Check for a dynamic initializer.
-            default = obj.trait_defaults(self.name)
-            if default is Undefined:
-                warn(
-                    "Explicit using of Undefined as the default value "
-                    "is deprecated in traitlets 5.0, and may cause "
-                    "exceptions in the future.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-            # Using a context manager has a large runtime overhead, so we
-            # write out the obj.cross_validation_lock call here.
-            _cross_validation_lock = obj._cross_validation_lock
-            try:
-                obj._cross_validation_lock = True
-                value = self._validate(obj, default)
-            finally:
-                obj._cross_validation_lock = _cross_validation_lock
-            obj._trait_values[self.name] = value
-            obj._notify_observers(
-                Bunch(
-                    name=self.name,
-                    value=value,
-                    owner=obj,
-                    type="default",
-                )
-            )
-            return value
+            if self._default_dependencies_for(obj):
+                # Iteratively materialize missing declared dependencies in
+                # topological order, so long chains cannot recurse into a
+                # stack overflow while a default reads another trait. A
+                # failed computation is never cached: the key stays missing,
+                # so the next access evaluates the default again.
+                value = obj._compute_derived_trait(self.name)
+            else:
+                value = obj._materialize_default(self.name)
+            return t.cast(G, value)
         except Exception as e:
             # This should never be reached.
             raise TraitError("Unexpected error in TraitType: default value not set properly") from e
@@ -745,6 +729,14 @@ class TraitType(BaseDescriptor, t.Generic[G, S]):
             old_value = self.default_value
 
         obj._trait_values[self.name] = new_value
+        # The value now comes from an explicit assignment/config injection
+        # (set/set_trait, __init__ kwargs, Configurable._load_config). Cached
+        # values produced by a dynamic default never pass through ``set``,
+        # so derived defaults stay unmarked.
+        obj._trait_explicit_values.add(self.name)
+        # The assignment itself wins; invalidate derived defaults that read
+        # this trait (explicitly assigned ones keep their value).
+        obj._invalidate_dependent_traits(self.name)
         try:
             silent = bool(old_value == new_value)
         except Exception:
@@ -770,7 +762,21 @@ class TraitType(BaseDescriptor, t.Generic[G, S]):
         delattr stores a sentinel so `hasattr` returns False
         """
         assert self.name is not None
-        obj._trait_values[self.name] = _DELETED
+        is_derived = bool(self._default_dependencies_for(obj))
+        participates = is_derived or bool(obj._dependent_traits().get(self.name))
+        if participates:
+            # Remove the explicit/derived value entirely: the next access
+            # lazily recomputes the dynamic default (derived mode restored).
+            obj._trait_explicit_values.discard(self.name)
+            obj._trait_values.pop(self.name, None)
+            obj._invalidate_dependent_traits(self.name)
+        else:
+            # Preserve the historical delattr semantics for ordinary traits.
+            obj._trait_values[self.name] = _DELETED
+
+    def _default_dependencies_for(self, obj: HasTraits) -> tuple[str, ...]:
+        deps = obj.__class__.__dict__.get("_default_dependencies", {}).get(self.name, ())
+        return t.cast("tuple[str, ...]", deps)
 
     def _validate(self, obj: t.Any, value: t.Any) -> G | None:
         if value is None and self.allow_none:
@@ -1061,6 +1067,11 @@ class MetaHasTraits(MetaHasDescriptors):
         cls._all_trait_default_generators = {}
         cls._traits = {}
         cls._static_immutable_initial_values = {}
+        # ``trait name -> tuple of trait names read by its dynamic default``
+        cls._default_dependencies: dict[str, tuple[str, ...]] = {}
+        # lazily populated reverse map; reset for every newly built class so
+        # dynamically added traits rebuild it
+        cls._default_dependents_cache: dict[str, tuple[str, ...]] | None = None
 
         super().setup_class(classdict)
 
@@ -1138,6 +1149,126 @@ class MetaHasTraits(MetaHasDescriptors):
                     # we always add it, because a class may change when we call add_trait
                     # and then the instance may not have all the _static_immutable_initial_values
                     cls._all_trait_default_generators[name] = trait.default
+
+                dependencies = _resolve_default_dependencies(
+                    t.cast("type[HasTraits]", cls), name, mro_trait
+                )
+                if dependencies:
+                    cls._default_dependencies[name] = dependencies
+
+        cycle = _find_dependency_cycle(cls._default_dependencies)
+        if cycle is not None:
+            path = " -> ".join(cycle)
+            raise TraitError(
+                f"Cyclic @depends_on declaration in {cls.__name__}: {path}. "
+                "Dynamic defaults may not (transitively) depend on themselves."
+            )
+
+
+def _resolve_default_dependencies(
+    cls: type[HasTraits],
+    name: str,
+    mro_trait: list[type],
+) -> tuple[str, ...]:
+    """Resolve the declared default dependencies for ``name`` along the MRO.
+
+    A class-level declaration replaces the inherited one unless it was made
+    with ``extend=True``; in that case the inherited names are kept and the
+    new ones are appended.
+    """
+    method_name = f"_{name}_default"
+    declared: list[t.Any] = []
+
+    def _from_metadata(t: TraitType[t.Any, t.Any]) -> tuple[str, ...]:
+        raw = t.metadata.get("depends_on")
+        if raw is None:
+            return ()
+        if isinstance(raw, str):
+            return (raw,)
+        return tuple(raw)
+
+    for c in mro_trait:
+        handler = c.__dict__.get("_trait_default_generators", {}).get(name)
+        if handler is not None:
+            declared.append(handler)
+        method = c.__dict__.get(method_name)
+        if method is not None:
+            declared.append(method)
+        meta_names = _from_metadata(c.__dict__.get(name, None)) if name in c.__dict__ else ()
+        if meta_names:
+            declared.append(("metadata", meta_names))
+
+    # Walk most-derived first: the nearest replacement terminates resolution
+    # and forms the prefix; extensions found below it are appended after it.
+    prefix: tuple[str, ...] = ()
+    extras: list[list[str]] = []
+    for entry in declared:
+        if isinstance(entry, tuple) and entry[0] == "metadata":
+            dep_names = entry[1]
+            mode = "replace"
+        else:
+            info = _depends_on_info(entry)
+            if info is None:
+                continue
+            dep_names, mode = info
+        if mode == "extend":
+            extras.append(list(dep_names))
+            continue
+        prefix = dep_names
+        break
+    else:
+        # No replacing declaration in this subtree: start from the nearest
+        # inherited dependency list (extensions accumulate on top of it).
+        for base in cls.mro()[1:]:
+            base_deps = base.__dict__.get("_default_dependencies")
+            if base_deps and name in base_deps:
+                prefix = base_deps[name]
+                break
+
+    ordered: list[str] = list(prefix)
+    for extra_group in reversed(extras):
+        for dep in extra_group:
+            if dep not in ordered:
+                ordered.append(dep)
+    return tuple(ordered)
+
+
+def _find_dependency_cycle(dependencies: dict[str, tuple[str, ...]]) -> list[str] | None:
+    """Find a dependency cycle with an iterative DFS.
+
+    Returns the node sequence of one cycle (first node repeated at the end)
+    or None. Uses an explicit stack so very long chains cannot recurse into
+    a stack overflow.
+    """
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color: dict[str, int] = {}
+
+    for start in dependencies:
+        if color.get(start, WHITE) != WHITE:
+            continue
+        # Each stack item is ``(node, iterator-over-dependencies)``.
+        stack: list[tuple[str, t.Iterator[str]]] = [(start, iter(dependencies.get(start, ())))]
+        path = [start]
+        color[start] = GRAY
+        while stack:
+            node, it = stack[-1]
+            advanced = False
+            for child in it:
+                child_color = color.get(child, WHITE)
+                if child_color == GRAY:
+                    cycle_start = path.index(child)
+                    return [*path[cycle_start:], child]
+                if child_color == WHITE:
+                    color[child] = GRAY
+                    stack.append((child, iter(dependencies.get(child, ()))))
+                    path.append(child)
+                    advanced = True
+                    break
+            if not advanced:
+                color[node] = BLACK
+                stack.pop()
+                path.pop()
+    return None
 
 
 def observe(*names: Sentinel | str, type: str = "change") -> ObserveHandler:
@@ -1335,6 +1466,89 @@ class DefaultHandler(EventHandler):
         cls._trait_default_generators[self.trait_name] = self
 
 
+# Attributes used to attach a dynamic-default dependency declaration to the
+# decorated object (either the default generator function or the
+# ``DefaultHandler`` produced by :func:`default`).
+_DEPENDS_ON_NAMES = "_trait_depends_on_names"
+_DEPENDS_ON_MODE = "_trait_depends_on_mode"
+
+
+def depends_on(
+    *names: str, extend: bool = False, replace: bool = False
+) -> t.Callable[[FuncT], FuncT]:
+    """Declare the traits read by a dynamic default generator.
+
+    This opt-in decorator documents and enforces the dependencies of a
+    dynamic default defined with :func:`default` (or the legacy
+    ``_<name>_default`` naming convention)::
+
+        class Sampling(HasTraits):
+            frequency = Float(10.0)
+            duration = Float(1.0)
+
+            @default("window")
+            @depends_on("frequency", "duration")
+            def _window_default(self):
+                return int(self.frequency * self.duration)
+
+    As long as ``window`` has not been assigned an explicit value (through
+    keyword arguments, attribute assignment or configuration), changing
+    ``frequency`` or ``duration`` invalidates the cached default and the
+    value is lazily recomputed on the next access. Once ``window`` is set
+    explicitly, dependency changes never overwrite it; deleting the explicit
+    value with ``del obj.window`` restores the derived default.
+
+    Parameters
+    ----------
+    *names
+        The trait names read by the default generator.
+    extend : bool, keyword-only
+        When True, add the given names to any declaration inherited from a
+        base class. By default a declaration replaces the inherited one.
+    replace : bool, keyword-only
+        Explicitly mark the declaration as a replacement (the default
+        behavior). ``extend`` and ``replace`` are mutually exclusive.
+
+    Notes
+    -----
+    The decorator may be stacked above or below :func:`default`.
+    """
+    if not names:
+        raise TypeError("depends_on requires at least one dependent trait name.")
+    for dep in names:
+        if not isinstance(dep, str):
+            raise TypeError(f"trait names passed to depends_on must be strings, not {dep!r}")
+    if extend and replace:
+        raise TypeError("depends_on: 'extend' and 'replace' are mutually exclusive.")
+    mode = "extend" if extend else "replace"
+
+    def _attach(func: FuncT) -> FuncT:
+        previous = getattr(func, _DEPENDS_ON_NAMES, ())
+        setattr(func, _DEPENDS_ON_NAMES, (*previous, *names))
+        setattr(func, _DEPENDS_ON_MODE, mode)
+        return func
+
+    return _attach
+
+
+def _depends_on_info(declaration: t.Any) -> tuple[tuple[str, ...], str] | None:
+    """Return ``(names, mode)`` attached to a default declaration."""
+    func = getattr(declaration, "func", None)
+    # An inner @depends_on attaches to the function, an outer one attaches
+    # to the DefaultHandler itself; merge both in application order.
+    func_names = getattr(func, _DEPENDS_ON_NAMES, ())
+    handler_names = getattr(declaration, _DEPENDS_ON_NAMES, ())
+    names = (*func_names, *handler_names)
+    if not names:
+        return None
+    mode = getattr(
+        declaration,
+        _DEPENDS_ON_MODE,
+        getattr(func, _DEPENDS_ON_MODE, "replace"),
+    )
+    return tuple(dict.fromkeys(names)), mode
+
+
 class HasDescriptors(metaclass=MetaHasDescriptors):
     """The base class for all classes that have descriptors."""
 
@@ -1367,18 +1581,24 @@ class HasDescriptors(metaclass=MetaHasDescriptors):
 
 class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
     _trait_values: dict[str, t.Any]
+    _trait_explicit_values: set[str]
     _static_immutable_initial_values: dict[str, t.Any]
     _trait_notifiers: dict[str | Sentinel, t.Any]
     _trait_validators: dict[str | Sentinel, t.Any]
     _cross_validation_lock: bool
     _traits: dict[str, t.Any]
     _all_trait_default_generators: dict[str, t.Any]
+    _default_dependencies: dict[str, tuple[str, ...]]
+    _default_dependents_cache: dict[str, tuple[str, ...]] | None
 
     def setup_instance(self, /, *args: t.Any, **kwargs: t.Any) -> None:
         # although we'd prefer to set only the initial values not present
         # in kwargs, we will overwrite them in `__init__`, and simply making
         # a copy of a dict is faster than checking for each key.
         self._trait_values = self._static_immutable_initial_values.copy()
+        # Names of traits holding explicitly assigned/configured values;
+        # cached values produced by dynamic defaults are never recorded here.
+        self._trait_explicit_values = set()
         self._trait_notifiers = {}
         self._trait_validators = {}
         self._cross_validation_lock = False
@@ -1449,12 +1669,20 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
         d["_trait_notifiers"] = {}
         d["_trait_validators"] = {}
         d["_trait_values"] = self._trait_values.copy()
+        d["_trait_explicit_values"] = self._trait_explicit_values.copy()
         d["_cross_validation_lock"] = False  # FIXME: raise if cloning locked!
 
         return d
 
     def __setstate__(self, state: dict[str, t.Any]) -> None:
         self.__dict__ = state.copy()
+        explicit = self.__dict__.get("_trait_explicit_values")
+        if explicit is None:
+            # Pickles produced before the dependency protocol existed did
+            # not record provenance; treat every materialized value as
+            # explicit so dependency changes cannot silently overwrite it.
+            explicit = {name for name, value in self._trait_values.items() if value is not _DELETED}
+        self._trait_explicit_values = set(explicit)
 
         # event handlers are reassigned to self
         cls = self.__class__
@@ -1798,7 +2026,35 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
             # __qualname__ introduced in Python 3.3 (see PEP 3155)
             attrs["__qualname__"] = cls.__qualname__
         attrs.update(traits)
-        self.__class__ = type(cls.__name__, (cls,), attrs)
+        new_cls = t.cast(type[HasTraits], type(cls.__name__, (cls,), attrs))
+        self.__class__ = new_cls
+        # Default generators / dependency declarations that referred to a
+        # trait that did not exist yet were skipped while building earlier
+        # classes; pick them up now that the traits have been added.
+        for added in traits:
+            method_name = f"_{added}_default"
+            for base in new_cls.mro()[1:]:
+                handler = base.__dict__.get("_trait_default_generators", {}).get(added)
+                if handler is not None:
+                    new_cls._all_trait_default_generators[added] = handler
+                    break
+                method = base.__dict__.get(method_name)
+                if method is not None:
+                    new_cls._all_trait_default_generators[added] = method
+                    break
+            trait = new_cls._traits.get(added)
+            if trait is not None and added not in new_cls.__dict__["_default_dependencies"]:
+                deps = _resolve_default_dependencies(new_cls, added, list(new_cls.mro()))
+                if deps:
+                    new_cls._default_dependencies[added] = deps
+        new_cls._default_dependents_cache = None
+        cycle = _find_dependency_cycle(new_cls.__dict__["_default_dependencies"])
+        if cycle is not None:
+            path = " -> ".join(cycle)
+            raise TraitError(
+                f"Cyclic @depends_on declaration in {new_cls.__name__}: {path}. "
+                "Dynamic defaults may not (transitively) depend on themselves."
+            )
         for trait in traits.values():
             trait.instance_init(self)
 
@@ -1808,6 +2064,182 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
         if not self.has_trait(name):
             raise TraitError(f"Class {cls.__name__} does not have a trait named {name}")
         getattr(cls, name).set(self, value)
+
+    @classmethod
+    def default_dependencies(cls, name: str) -> tuple[str, ...]:
+        """Return the trait names declared with :func:`depends_on` for ``name``.
+
+        Returns an empty tuple if the dynamic default of ``name`` declared no
+        dependencies.
+        """
+        deps = cls.__dict__.get("_default_dependencies", {}).get(name, ())
+        return t.cast("tuple[str, ...]", deps)
+
+    def trait_is_default(self, name: str) -> bool:
+        """Return whether ``name`` currently holds a derived default value.
+
+        This is True when the trait has a cached value that was produced by
+        its dynamic default and has never been explicitly assigned (or the
+        explicit value was deleted with ``del``).
+        """
+        if not self.has_trait(name):
+            raise TraitError(f"Class {self.__class__.__name__} does not have a trait named {name}")
+        return (
+            name not in self._trait_explicit_values
+            and name in self._trait_values
+            and self._trait_values[name] is not _DELETED
+        )
+
+    def _dependent_traits(self) -> dict[str, tuple[str, ...]]:
+        """Reverse dependency map: ``changed trait -> traits it affects``.
+
+        Built lazily on first use and cached per class. References to
+        non-existent traits raise here (the first time declarations are
+        exercised) with an actionable message.
+        """
+        cls = self.__class__
+        cache = cls.__dict__.get("_default_dependents_cache")
+        if cache is not None:
+            return t.cast("dict[str, tuple[str, ...]]", cache)
+
+        declarations = cls.__dict__.get("_default_dependencies", {})
+        if not declarations:
+            cls._default_dependents_cache = {}
+            return {}
+
+        known_traits = set(cls.class_trait_names())
+        reverse: dict[str, list[str]] = {}
+        for target, deps in declarations.items():
+            for dep in deps:
+                if dep not in known_traits:
+                    raise TraitError(
+                        f"Invalid @depends_on declaration for {target!r} in "
+                        f"{cls.__name__}: {dep!r} is not a trait of {cls.__name__}."
+                    )
+                reverse.setdefault(dep, [])
+                if target not in reverse[dep]:
+                    reverse[dep].append(target)
+        frozen = {dep: tuple(targets) for dep, targets in reverse.items()}
+        cls._default_dependents_cache = frozen
+        return frozen
+
+    def _invalidate_dependent_traits(self, changed: str) -> None:
+        """Invalidate cached derived defaults reachable from ``changed``.
+
+        Propagation is lazy and topological: a trait holding an explicit
+        value blocks propagation through itself, and each affected cache is
+        dropped at most once (diamond-safe). No change events are emitted;
+        the next ``getattr`` recomputes the default following the usual lazy
+        semantics.
+        """
+        reverse = self._dependent_traits()
+        if not reverse:
+            return
+        if changed not in reverse:
+            return
+        queue: collections.deque[str] = collections.deque(reverse[changed])
+        seen: set[str] = set()
+        while queue:
+            name = queue.popleft()
+            if name in seen:
+                continue
+            seen.add(name)
+            if name in self._trait_explicit_values:
+                # Explicitly assigned: keep the value and stop propagation.
+                continue
+            self._trait_values.pop(name, None)
+            downstream = reverse.get(name)
+            if downstream:
+                queue.extend(downstream)
+
+    def _materialize_default(self, name: str) -> t.Any:
+        """Compute and cache one trait's dynamic default.
+
+        Mirrors the historical lazy behavior: the value is validated while
+        the cross-validation lock is held, cached, then a ``type="default"``
+        notification is emitted. Nothing is cached when the generator or
+        validation raises.
+        """
+        default = self.trait_defaults(name)
+        if default is Undefined:
+            warn(
+                "Explicit using of Undefined as the default value "
+                "is deprecated in traitlets 5.0, and may cause "
+                "exceptions in the future.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        trait = self._traits[name]
+        # Using a context manager has a large runtime overhead, so we
+        # write out the cross_validation_lock call here.
+        _cross_validation_lock = self._cross_validation_lock
+        try:
+            self._cross_validation_lock = True
+            value = trait._validate(self, default)
+        finally:
+            self._cross_validation_lock = _cross_validation_lock
+        self._trait_values[name] = value
+        self._notify_observers(
+            Bunch(
+                name=name,
+                value=value,
+                owner=self,
+                type="default",
+            )
+        )
+        return value
+
+    def _compute_derived_trait(self, target: str) -> t.Any:
+        """Materialize ``target`` and its missing dependencies iteratively.
+
+        Traits with declared :func:`depends_on` dependencies are computed in
+        dependency order without nested descriptor calls, so multi-level
+        chains of any length cannot recurse into a stack overflow. Each
+        default generator runs at most once per materialization (also across
+        diamonds).
+        """
+        declarations = self.__class__.__dict__.get("_default_dependencies", {})
+
+        def _present(name: str) -> bool:
+            return name in self._trait_values and self._trait_values[name] is not _DELETED
+
+        # Iterative post-order DFS over the *missing* declared dependencies,
+        # so each needed default is evaluated exactly once in dependency
+        # order without nested descriptor calls (no stack overflow on long
+        # chains, one evaluation per node even across diamonds).
+        order: list[str] = []
+        done: set[str] = set()
+        on_stack: set[str] = set()
+        stack: list[tuple[str, t.Iterator[str]]] = [(target, iter(declarations[target]))]
+        on_stack.add(target)
+        while stack:
+            node, it = stack[-1]
+            descended = False
+            for dep in it:
+                if dep in done or dep in on_stack:
+                    continue
+                if _present(dep) or dep not in declarations:
+                    # Value exists (explicit/cached) or the dependency is a
+                    # plain trait: nothing to materialize for it here.
+                    continue
+                stack.append((dep, iter(declarations[dep])))
+                on_stack.add(dep)
+                descended = True
+                break
+            if descended:
+                continue
+            done.add(node)
+            on_stack.discard(node)
+            if not _present(node) and node not in self._trait_explicit_values:
+                order.append(node)
+            stack.pop()
+
+        value: t.Any = None
+        for name in order:
+            value = self._materialize_default(name)
+        if target in self._trait_explicit_values or _present(target):
+            return self._trait_values[target]
+        return value
 
     @classmethod
     def class_trait_names(cls: type[HasTraits], **metadata: t.Any) -> list[str]:

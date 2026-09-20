@@ -54,6 +54,15 @@ return the default value. For example::
             return getpass.getuser()
 
 
+Declaring dependencies between dynamic defaults
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. autofunction:: depends_on
+
+See :ref:`dynamic_default_dependencies` for the full semantics (invalidation,
+explicit values, inheritance, diamonds, cycles and event timing).
+
+
 Callbacks when trait attributes change
 --------------------------------------
 
