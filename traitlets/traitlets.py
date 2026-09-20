@@ -745,6 +745,10 @@ class TraitType(BaseDescriptor, t.Generic[G, S]):
             old_value = self.default_value
 
         obj._trait_values[self.name] = new_value
+        # An explicit assignment (user code, keyword argument or config
+        # loading) pins the value: it is no longer a derived default and
+        # must not be invalidated by dependency changes.
+        obj._explicit_traits.add(self.name)
         try:
             silent = bool(old_value == new_value)
         except Exception:
@@ -753,6 +757,7 @@ class TraitType(BaseDescriptor, t.Generic[G, S]):
         if silent is not True:
             # we explicitly compare silent to True just in case the equality
             # comparison above returns something other than True/False
+            obj._invalidate_dependent_defaults(self.name)
             obj._notify_trait(self.name, old_value, new_value)
 
     def __set__(self, obj: HasTraits, value: S) -> None:
@@ -770,7 +775,15 @@ class TraitType(BaseDescriptor, t.Generic[G, S]):
         delattr stores a sentinel so `hasattr` returns False
         """
         assert self.name is not None
-        obj._trait_values[self.name] = _DELETED
+        if self.name in obj._all_trait_default_dependencies:
+            # Traits with declared default dependencies opt into derived
+            # mode: deleting an explicit value restores the dynamic default,
+            # and dependents of this trait are invalidated as well.
+            obj._trait_values.pop(self.name, None)
+            obj._explicit_traits.discard(self.name)
+            obj._invalidate_dependent_defaults(self.name)
+        else:
+            obj._trait_values[self.name] = _DELETED
 
     def _validate(self, obj: t.Any, value: t.Any) -> G | None:
         if value is None and self.allow_none:
@@ -1051,12 +1064,104 @@ class MetaHasDescriptors(type):
                 cls._descriptors.append(v)
 
 
+def _resolve_default_dependencies(
+    cls: type[HasTraits] | MetaHasTraits,
+) -> tuple[dict[str, frozenset[str]], dict[str, frozenset[str]]]:
+    """Resolve declared default-value dependencies for a HasTraits class.
+
+    Declarations come from ``@default(name, depends_on=...)`` handlers and
+    from the ``default_depends_on`` trait metadata. Walking the MRO, the
+    declaration nearest to the class wins for each trait, so subclasses may
+    extend or replace the dependencies declared on their parents.
+
+    Returns a tuple of two dicts: the direct dependencies of each trait and
+    the reverse mapping (a trait to the traits whose defaults depend on it).
+    """
+    resolved: dict[str, set[str]] = {}
+    for klass in cls.mro():
+        own: dict[str, set[str]] = {}
+        for name, deps in klass.__dict__.get("_trait_default_dependencies", {}).items():
+            own.setdefault(name, set()).update(deps)
+        for attr_name, value in klass.__dict__.items():
+            if isinstance(value, TraitType):
+                declared = value.metadata.get("default_depends_on")
+                if declared:
+                    own.setdefault(attr_name, set()).update(declared)
+        for name, deps in own.items():
+            if name not in resolved:
+                resolved[name] = deps
+
+    for name in sorted(resolved):
+        if name not in cls._traits:
+            raise TraitError(
+                f"default dependencies were declared for {name!r}, "
+                f"which is not a trait of {cls.__name__!r}"
+            )
+        for dependency in sorted(resolved[name]):
+            if dependency not in cls._traits:
+                raise TraitError(
+                    f"the default for {name!r} declares a dependency on {dependency!r}, "
+                    f"which is not a trait of {cls.__name__!r}"
+                )
+
+    dependencies = {name: frozenset(deps) for name, deps in resolved.items() if deps}
+    _check_default_dependency_cycles(cls, dependencies)
+
+    dependents: dict[str, set[str]] = {}
+    for name, deps in dependencies.items():
+        for dependency in deps:
+            dependents.setdefault(dependency, set()).add(name)
+    return dependencies, {name: frozenset(traits) for name, traits in dependents.items()}
+
+
+def _check_default_dependency_cycles(
+    cls: type[HasTraits] | MetaHasTraits, dependencies: dict[str, frozenset[str]]
+) -> None:
+    """Detect cycles in the default-dependency graph.
+
+    Uses an explicit stack so that pathological graphs raise a TraitError
+    naming the cycle instead of recursing into a RecursionError.
+    """
+    white, gray, black = 0, 1, 2
+    color: dict[str, int] = {}
+    for root in sorted(dependencies):
+        if color.get(root, white) != white:
+            continue
+        color[root] = gray
+        path = [root]
+        stack = [iter(sorted(dependencies[root]))]
+        while stack:
+            descended = False
+            for nxt in stack[-1]:
+                if nxt not in dependencies:
+                    # A trait without declared dependencies is a leaf and
+                    # cannot be part of a cycle.
+                    continue
+                state = color.get(nxt, white)
+                if state == gray:
+                    cycle = [*path[path.index(nxt) :], nxt]
+                    raise TraitError(
+                        f"circular dependency detected in the default generators of "
+                        f"{cls.__name__!r}: {' -> '.join(cycle)}"
+                    )
+                if state == white:
+                    color[nxt] = gray
+                    path.append(nxt)
+                    stack.append(iter(sorted(dependencies[nxt])))
+                    descended = True
+                    break
+            if not descended:
+                color[path.pop()] = black
+                stack.pop()
+
+
 class MetaHasTraits(MetaHasDescriptors):
     """A metaclass for HasTraits."""
 
     def setup_class(cls: MetaHasTraits, classdict: dict[str, t.Any]) -> None:
         # for only the current class
         cls._trait_default_generators: dict[str, t.Any] = {}
+        cls._trait_default_dependencies: dict[str, frozenset[str]] = {}
         # also looking at base classes
         cls._all_trait_default_generators = {}
         cls._traits = {}
@@ -1138,6 +1243,11 @@ class MetaHasTraits(MetaHasDescriptors):
                     # we always add it, because a class may change when we call add_trait
                     # and then the instance may not have all the _static_immutable_initial_values
                     cls._all_trait_default_generators[name] = trait.default
+
+        (
+            cls._all_trait_default_dependencies,
+            cls._trait_default_dependents,
+        ) = _resolve_default_dependencies(cls)
 
 
 def observe(*names: Sentinel | str, type: str = "change") -> ObserveHandler:
@@ -1241,13 +1351,22 @@ def validate(*names: Sentinel | str) -> ValidateHandler:
     return ValidateHandler(names)
 
 
-def default(name: str) -> DefaultHandler:
+def default(name: str, depends_on: t.Iterable[str] | None = None) -> DefaultHandler:
     """A decorator which assigns a dynamic default for a Trait on a HasTraits object.
 
     Parameters
     ----------
     name
         The str name of the Trait on the object whose default should be generated.
+    depends_on
+        Optional iterable of trait names that the dynamic default reads its
+        inputs from. While the trait holds a derived (not explicitly
+        assigned) value, a change to any of these traits invalidates the
+        cached default, which is then recomputed lazily on next access.
+        Once the trait is explicitly assigned (directly, via keyword
+        argument, or via config), dependency changes no longer affect it.
+        Deleting an explicitly assigned trait with declared dependencies
+        restores the derived default.
 
     Notes
     -----
@@ -1276,10 +1395,24 @@ def default(name: str) -> DefaultHandler:
             def some_other_default(self):  # This default generator should not be
                 return 3.0                 # ignored since it is defined in a
                                            # class derived from B.a.this_class.
+
+    Dependencies may also be declared via the ``default_depends_on``
+    metadata key, e.g. ``Int().tag(default_depends_on=["other"])``.
+    Declarations on a subclass replace those of a parent class for the
+    same trait. Declaring a dependency on a name that is not a trait of
+    the class, or declaring a cycle of dependencies, raises a
+    :exc:`TraitError` when the class is created.
+
+    .. versionadded:: 5.17
     """
     if not isinstance(name, str):
         raise TypeError(f"Trait name must be a string or All, not {name!r}")
-    return DefaultHandler(name)
+    if depends_on is not None:
+        depends_on = tuple(depends_on)
+        for dependency in depends_on:
+            if not isinstance(dependency, str):
+                raise TypeError(f"dependency names must be strings, not {dependency!r}")
+    return DefaultHandler(name, depends_on=depends_on)
 
 
 FuncT = t.TypeVar("FuncT", bound=t.Callable[..., t.Any])
@@ -1327,12 +1460,15 @@ class ValidateHandler(EventHandler):
 
 
 class DefaultHandler(EventHandler):
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, depends_on: t.Iterable[str] | None = None) -> None:
         self.trait_name = name
+        self.depends_on = tuple(depends_on) if depends_on is not None else None
 
     def class_init(self, cls: type[HasTraits], name: str | None) -> None:
         super().class_init(cls, name)
         cls._trait_default_generators[self.trait_name] = self
+        if self.depends_on is not None:
+            cls._trait_default_dependencies[self.trait_name] = frozenset(self.depends_on)
 
 
 class HasDescriptors(metaclass=MetaHasDescriptors):
@@ -1367,18 +1503,22 @@ class HasDescriptors(metaclass=MetaHasDescriptors):
 
 class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
     _trait_values: dict[str, t.Any]
+    _explicit_traits: set[str]
     _static_immutable_initial_values: dict[str, t.Any]
     _trait_notifiers: dict[str | Sentinel, t.Any]
     _trait_validators: dict[str | Sentinel, t.Any]
     _cross_validation_lock: bool
     _traits: dict[str, t.Any]
     _all_trait_default_generators: dict[str, t.Any]
+    _all_trait_default_dependencies: dict[str, frozenset[str]]
+    _trait_default_dependents: dict[str, frozenset[str]]
 
     def setup_instance(self, /, *args: t.Any, **kwargs: t.Any) -> None:
         # although we'd prefer to set only the initial values not present
         # in kwargs, we will overwrite them in `__init__`, and simply making
         # a copy of a dict is faster than checking for each key.
         self._trait_values = self._static_immutable_initial_values.copy()
+        self._explicit_traits = set()
         self._trait_notifiers = {}
         self._trait_validators = {}
         self._cross_validation_lock = False
@@ -1455,6 +1595,8 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
 
     def __setstate__(self, state: dict[str, t.Any]) -> None:
         self.__dict__ = state.copy()
+        # instances pickled before explicit-value tracking existed
+        self.__dict__.setdefault("_explicit_traits", set())
 
         # event handlers are reassigned to self
         cls = self.__class__
@@ -1565,6 +1707,37 @@ class HasTraits(HasDescriptors, metaclass=MetaHasTraits):
                 type="change",
             )
         )
+
+    def _invalidate_dependent_defaults(self, name: str) -> None:
+        """Invalidate cached dynamic defaults that depend on ``name``.
+
+        Only traits still in derived mode (i.e. not explicitly assigned) are
+        invalidated; invalidation simply drops the cached value so that the
+        default is recomputed lazily on next access, and no notification is
+        emitted. The invalidation propagates transitively along the declared
+        dependency graph, visiting each trait at most once so that diamond
+        shaped graphs invalidate their downstream traits a single time.
+        """
+        dependents = self._trait_default_dependents
+        if not dependents or name not in dependents:
+            return
+        explicit = self._explicit_traits
+        values = self._trait_values
+        seen = {name}
+        stack = list(dependents[name])
+        while stack:
+            dependent = stack.pop()
+            if dependent in seen:
+                continue
+            seen.add(dependent)
+            if dependent in explicit:
+                # Explicitly assigned values are never invalidated, and as
+                # their value does not change, their own dependents remain
+                # valid as well.
+                continue
+            values.pop(dependent, None)
+            if dependent in dependents:
+                stack.extend(dependents[dependent])
 
     def notify_change(self, change: Bunch) -> None:
         """Notify observers of a change event"""

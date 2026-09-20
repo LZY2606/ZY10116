@@ -44,6 +44,77 @@ subclasses:
     TraitError: The 'bar' trait of a Foo instance must be an int,
     but a value of '3' <class 'str'> was specified
 
+Dependent default values
+------------------------
+
+A dynamic default often derives its value from other traits, for instance a
+sampling window computed from a frequency and a duration. By default,
+traitlets cannot tell a cached derived value apart from an explicitly
+assigned one, so later changes to the inputs are not reflected. Declaring
+dependencies with ``depends_on`` opts into an invalidation protocol:
+
+.. code:: python
+
+    from traitlets import HasTraits, Int, Float, default
+
+
+    class Sampler(HasTraits):
+        freq = Int(100)
+        duration = Float(1.0)
+        window = Int()
+
+        @default("window", depends_on=["freq", "duration"])
+        def _window_default(self):
+            return int(self.freq * self.duration)
+
+
+    s = Sampler()
+    s.window  # 100, computed lazily and cached
+    s.freq = 200  # invalidates the cached default
+    s.window  # 200, recomputed on access
+    s.window = 42  # explicit assignment: the value is now pinned
+    s.freq = 5
+    s.window  # 42, dependency changes no longer apply
+    del s.window  # deleting the explicit value restores the derived default
+    s.window  # 5
+
+Dependencies may also be declared with the ``default_depends_on`` metadata
+key, e.g. ``window = Int().tag(default_depends_on=["freq", "duration"])``,
+which combines with a plain ``@default("window")`` generator.
+
+The semantics are designed to match the existing lazy behaviour of dynamic
+defaults:
+
+- **Derived vs. explicit.** A trait is in *derived* mode until it is
+  explicitly assigned — directly, via a constructor keyword argument, or via
+  config loading. Only derived values are invalidated by dependency changes;
+  explicit values are never overwritten. Deleting a trait that declares
+  dependencies drops the explicit value and restores derived mode.
+- **Laziness.** Invalidation only drops the cached value; it never
+  recomputes eagerly and emits no ``change`` notification. The default is
+  recomputed on the next read, which emits the usual ``type="default"``
+  notification, exactly as for the first computation. Validation behaves as
+  it does for a first-time default: the trait type's own validation runs,
+  while ``@validate`` cross-validators remain skipped under the
+  cross-validation lock.
+- **Propagation.** Invalidation propagates transitively along the declared
+  dependency graph. Each affected trait is invalidated at most once per
+  change, so diamond-shaped graphs invalidate their downstream traits a
+  single time. Propagation stops at explicitly assigned traits, whose values
+  — and therefore whose own dependents — remain valid.
+- **Batched changes.** Inside :meth:`~.HasTraits.hold_trait_notifications`,
+  invalidation applies immediately as each dependency is assigned, and since
+  invalidation itself emits no events there is nothing extra to merge; the
+  held ``change`` notifications of the dependencies are compressed as usual.
+- **Inheritance.** Subclasses may declare dependencies for additional
+  traits, or redeclare the dependencies of an inherited trait, in which case
+  the subclass declaration replaces the parent's. Cached and explicit state
+  is kept per instance and never shared.
+- **Errors.** Declaring a dependency on a name that is not a trait of the
+  class, or declaring a cycle of dependencies, raises a :exc:`TraitError`
+  naming the offending path when the class is created. If a default
+  computation raises, nothing is cached and the next access retries.
+
 observe
 -------
 
